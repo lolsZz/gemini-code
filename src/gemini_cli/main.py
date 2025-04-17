@@ -12,9 +12,9 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from pathlib import Path
 import yaml
-import google.generativeai as genai
 import logging
 import time
+import fnmatch # Added for .gitignore pattern matching
 
 from .models.gemini import GeminiModel, list_available_models
 from .config import Config
@@ -127,12 +127,100 @@ def start_interactive_session(model_name: str, console: Console):
     """Start an interactive chat session with the selected Gemini model."""
     if not config: console.print("[bold red]Config error.[/bold red]"); return
 
-    # --- Display Welcome Art ---
+    # --- Get Workspace Info & Initial Context ---
+    initial_context = ""
+    workspace_info = "(Could not determine workspace info)"
+    try:
+        cwd = os.getcwd()
+        root_folder_name = os.path.basename(cwd)
+        file_count = 0
+        ignored_dirs = {'.git', '.vscode', '__pycache__', '.idea', '.pytest_cache', 'node_modules', 'venv', '.venv', 'env', '.env', 'dist', 'build', '.eggs', 'site'}
+        ignored_patterns = []
+        gitignore_path = os.path.join(cwd, '.gitignore')
+        
+        # --- Improved .gitignore Parsing ---
+        if os.path.exists(gitignore_path):
+            try:
+                with open(gitignore_path, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            # Store patterns for fnmatch
+                            ignored_patterns.append(line)
+            except Exception as gitignore_err:
+                log.warning(f"Could not read or parse .gitignore: {gitignore_err}")
+        # --- End Improved .gitignore Parsing ---
+
+        # --- Use Tree Tool for Initial Context --- 
+        log.info("Attempting to use TreeTool for initial context.")
+        tree_tool_instance = AVAILABLE_TOOLS.get("tree")
+        if tree_tool_instance:
+            try:
+                # Instantiate and execute the tree tool (depth 3 default)
+                tree_output = tree_tool_instance().execute(depth=3) 
+                if "Error:" not in tree_output:
+                    initial_context = f"Current directory structure (from initial `tree -L 3`):\n```\n{tree_output}\n```\n"
+                    log.info("Successfully used TreeTool for initial context.")
+                else:
+                    log.warning(f"TreeTool execution failed: {tree_output}. Falling back to ls.")
+                    initial_context = "" # Reset context if tree failed
+            except Exception as tree_err:
+                log.error(f"Error executing TreeTool: {tree_err}", exc_info=True)
+                initial_context = "" # Reset context on error
+        else:
+            log.warning("TreeTool not found in AVAILABLE_TOOLS. Falling back to ls.")
+        
+        # --- Fallback/Supplement with LS if Tree failed or wasn't available ---
+        if not initial_context:
+            log.info("Falling back to LsTool for initial context.")
+            ls_tool_instance = AVAILABLE_TOOLS.get("ls")
+            if ls_tool_instance:
+                try:
+                    ls_output = ls_tool_instance().execute()
+                    if "Error:" not in ls_output:
+                        initial_context = f"Current directory contents (from initial `ls -lA`):\n```\n{ls_output}\n```\n"
+                        log.info("Successfully used LsTool for fallback initial context.")
+                    else:
+                        log.error(f"LsTool execution failed: {ls_output}")
+                        initial_context = "Error: Could not retrieve directory listing via ls."
+                except Exception as ls_err:
+                    log.error(f"Error executing LsTool: {ls_err}", exc_info=True)
+                    initial_context = "Error: Could not retrieve directory listing via ls."
+            else:
+                 log.error("CRITICAL: LsTool not found. Cannot provide initial context.")
+                 initial_context = "Error: Could not retrieve directory listing. Essential tools missing."
+        # --- End Fallback/Supplement --- 
+
+        # --- File Count (Respecting .gitignore) ---
+        for root, dirs, files in os.walk(cwd, topdown=True):
+            # Filter ignored directories more effectively
+            original_dirs = dirs[:]
+            dirs[:] = [d for d in original_dirs 
+                       if d not in ignored_dirs and 
+                       not any(fnmatch.fnmatch(os.path.join(root, d), os.path.join(cwd, p)) for p in ignored_patterns)]
+            
+            # Filter ignored files using fnmatch
+            files_to_count = [f for f in files 
+                              if not any(fnmatch.fnmatch(os.path.join(root, f), os.path.join(cwd, p)) for p in ignored_patterns)]
+            file_count += len(files_to_count)
+        # --- End File Count ---
+            
+        workspace_info = f"Root: [cyan]{root_folder_name}[/cyan] | Files (approx): [cyan]{file_count}[/cyan]"
+    except Exception as ws_info_err:
+        log.error(f"Error getting workspace info: {ws_info_err}", exc_info=True)
+        workspace_info = "(Could not determine workspace info)"
+        if not initial_context: # Ensure some context error is passed if everything failed
+             initial_context = "Error: Failed to gather workspace information and directory listing."
+    # --- End Workspace Info & Initial Context ---
+
+    # --- Display Welcome --- 
     console.clear()
     # console.print(GEMINI_CODE_ART) # <-- Commented out
-    console.print(Panel("[b]Welcome to Gemini Code AI Assistant![/b]", border_style="blue", expand=False))
+    # --- MODIFIED: Added model name to panel ---
+    console.print(Panel(f"[b]Gemini Code AI Assistant[/b]\nModel: [bold yellow]{model_name}[/bold yellow]\n{workspace_info}", border_style="blue", expand=False))
+    # --- END MODIFIED ---
     time.sleep(0.1)
-    # --- End Welcome Art ---
+    # --- End Welcome --- 
 
     api_key = config.get_api_key("google")
     if not api_key:
@@ -141,10 +229,11 @@ def start_interactive_session(model_name: str, console: Console):
         return
 
     try:
-        console.print(f"\nInitializing model [bold]{model_name}[/bold]...")
-        # Pass the console object to GeminiModel constructor
-        model = GeminiModel(api_key=api_key, console=console, model_name=model_name)
-        console.print("[green]Model initialized successfully.[/green]\n")
+        console.print(f"\nInitializing assistant with model [bold]{model_name}[/bold]...")
+        # --- MODIFIED: Pass initial_context to GeminiModel --- 
+        model = GeminiModel(api_key=api_key, console=console, model_name=model_name, initial_context=initial_context)
+        # --- END MODIFIED ---
+        console.print("[green]✓ Model initialized successfully.[/green]\n")
 
     except Exception as e:
         console.print(f"\n[bold red]Error initializing model '{model_name}':[/bold red] {e}")
@@ -161,6 +250,14 @@ def start_interactive_session(model_name: str, console: Console):
 
             if user_input.lower() == '/exit': break
             elif user_input.lower() == '/help': show_help(); continue
+            
+            # --- ADDED: Token Estimation --- 
+            input_tokens = count_tokens(user_input)
+            # Estimate history tokens (can be refined)
+            # history_tokens = count_tokens(str(model.chat_history)) 
+            # console.print(f"[dim]Input tokens: ~{input_tokens} | History tokens: ~{history_tokens}[/dim]")
+            console.print(f"[dim]Input tokens: ~{input_tokens}[/dim]") # Simpler version for now
+            # --- END ADDED ---
 
             # Display initial "thinking" status - generate handles intermediate ones
             response_text = model.generate(user_input)
@@ -189,23 +286,25 @@ def show_help():
         tool_list_formatted = "  (No tools available)"
         
     # Use direct rich markup and ensure newlines are preserved
+    # --- MODIFIED: Added note about tool usage ---
     help_text = f""" [bold]Help[/bold]
 
  [cyan]Interactive Commands:[/cyan]
-  /exit
-  /help
+  /exit          Exit the current session.
+  /help          Show this help message.
 
- [cyan]CLI Commands:[/cyan]
-  gemini setup KEY
-  gemini list-models
-  gemini set-default-model NAME
-  gemini --model NAME
+ [cyan]CLI Commands (Run from your shell):[/cyan]
+  gemini setup KEY             Set your Google API key.
+  gemini list-models           List available models.
+  gemini set-default-model NAME Set the default model for sessions.
+  gemini --model NAME          Start a session with a specific model.
 
- [cyan]Workflow Hint:[/cyan] Analyze -> Plan -> Execute -> Verify -> Summarize
+ [cyan]Workflow Hint:[/cyan] The assistant analyzes your request, plans steps, and executes actions using tools. It should ask for confirmation before making file changes.
 
- [cyan]Available Tools:[/cyan]
+ [cyan]Available Tools (Used automatically by the assistant):[/cyan]
 {tool_list_formatted}
 """
+    # --- END MODIFIED ---
     # Print directly to Panel without Markdown wrapper
     console.print(Panel(help_text, title="Help", border_style="green", expand=False))
 

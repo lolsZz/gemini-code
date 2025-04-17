@@ -10,6 +10,7 @@ import time
 from rich.console import Console
 from rich.panel import Panel
 import questionary
+import os
 
 # Import exceptions for specific error handling if needed later
 from google.api_core.exceptions import ResourceExhausted
@@ -44,13 +45,16 @@ def list_available_models(api_key):
 class GeminiModel:
     """Interface for Gemini models using native function calling agentic loop."""
 
-    def __init__(self, api_key: str, console: Console, model_name: str ="gemini-2.5-pro-exp-03-25"):
+    # --- MODIFIED: Added initial_context parameter --- 
+    def __init__(self, api_key: str, console: Console, model_name: str ="gemini-2.5-pro-exp-03-25", initial_context: str | None = None):
         """Initialize the Gemini model interface."""
         self.api_key = api_key
         self.initial_model_name = model_name
         self.current_model_name = model_name
         self.console = console
+        self.initial_context = initial_context or "Error: Initial directory context was not provided." # Store initial context
         genai.configure(api_key=api_key)
+        # --- END MODIFIED ---
 
         self.generation_config = genai.types.GenerationConfig(temperature=0.4, top_p=0.95, top_k=40)
         self.safety_settings = { "HARASSMENT": "BLOCK_MEDIUM_AND_ABOVE", "HATE": "BLOCK_MEDIUM_AND_ABOVE", "SEXUAL": "BLOCK_MEDIUM_AND_ABOVE", "DANGEROUS": "BLOCK_MEDIUM_AND_ABOVE" }
@@ -64,12 +68,16 @@ class GeminiModel:
         self.system_instruction = self._create_system_prompt()
         # ---
 
-        # --- Initialize Persistent History ---
+        # --- Initialize Persistent History --- 
+        # --- MODIFIED: Use provided initial_context --- 
         self.chat_history = [
-            {'role': 'user', 'parts': [self.system_instruction]},
-            {'role': 'model', 'parts': ["Okay, I'm ready. Provide the directory context and your request."]}
+            # System instruction is now passed directly to the model instance
+            # {'role': 'user', 'parts': [self.system_instruction]}, 
+            # Model doesn't need to acknowledge readiness here, context is provided with first user prompt
+            # {'role': 'model', 'parts': ["Okay, I'm ready. Provide the directory context and your request."]}
         ]
-        log.info("Initialized persistent chat history.")
+        log.info("Initialized persistent chat history (will add context with first user prompt).")
+        # --- END MODIFIED ---
         # ---
 
         try:
@@ -109,44 +117,22 @@ class GeminiModel:
                  logging.info(f"Handled command: {command}")
                  return None # Or return specific help text
 
-        # === Step 1: Mandatory Orientation ===
-        orientation_context = ""
-        ls_result = None # Initialize to None
-        try:
-            logging.info("Performing mandatory orientation (ls).")
-            ls_tool = get_tool("ls")
-            if ls_tool:
-                # Clear args just in case, assuming ls takes none for basic root listing
-                ls_result = ls_tool.execute()
-                # === START DEBUG LOGGING ===
-                log.debug(f"LsTool raw result:\n---\n{ls_result}\n---")
-                # === END DEBUG LOGGING ===
-                log.info(f"Orientation ls result length: {len(ls_result) if ls_result else 0}") # Changed from logging full result
-                self.console.print(f"[dim]Directory context acquired via 'ls'.[/dim]")
-                orientation_context = f"Current directory contents (from initial `ls`):\n```\n{ls_result}\n```\n"
-            else:
-                log.error("CRITICAL: Could not find 'ls' tool for mandatory orientation.")
-                # Stop execution if ls tool is missing - fundamental context is unavailable
-                return "Error: The essential 'ls' tool is missing. Cannot proceed."
-
-        except Exception as orient_error:
-            log.error(f"Error during mandatory orientation (ls): {orient_error}", exc_info=True)
-            error_message = f"Error during initial directory scan: {orient_error}"
-            orientation_context = f"{error_message}\n"
-            self.console.print(f"[bold red]Error getting initial directory listing: {orient_error}[/bold red]")
-            # Stop execution if initial ls fails - context is unreliable
-            return f"Error: Failed to get initial directory listing. Cannot reliably proceed. Details: {orient_error}"
-
-        # === Step 2: Prepare Initial User Turn ===
-        # Combine orientation with the actual user request
-        turn_input_prompt = f"{orientation_context}\nUser request: {original_user_prompt}"
+        # === Step 1: Prepare Initial User Turn (IF history is empty) ===
+        # --- MODIFIED: Combine initial context ONLY for the very first user message --- 
+        if not self.chat_history: # Check if history is empty (first turn)
+            turn_input_prompt = f"{self.initial_context}\n\nUser request: {original_user_prompt}"
+            log.info("First turn: Combining initial context with user prompt.")
+            self.chat_history.append({'role': 'user', 'parts': [turn_input_prompt]})
+        else:
+            # For subsequent turns, just add the user's prompt directly
+            log.info("Subsequent turn: Adding user prompt directly to history.")
+            self.chat_history.append({'role': 'user', 'parts': [original_user_prompt]})
+        # --- END MODIFIED ---
         
-        # Add this combined input to the PERSISTENT history
-        self.chat_history.append({'role': 'user', 'parts': [turn_input_prompt]})
         # === START DEBUG LOGGING ===
-        log.debug(f"Prepared turn_input_prompt (sent to LLM):\n---\n{turn_input_prompt}\n---")
+        log.debug(f"Input added to chat_history (last item):\n---\n{self.chat_history[-1]}\n---")
         # === END DEBUG LOGGING ===
-        self._manage_context_window() # Truncate *before* sending the first request
+        self._manage_context_window() # Truncate *before* sending the request
 
         iteration_count = 0
         task_completed = False
@@ -189,7 +175,7 @@ class GeminiModel:
                         last_text_response = "(Agent received response candidate with no content/parts)"
                         task_completed = True; final_summary = last_text_response; break
 
-                    # --- REVISED LOOP LOGIC FOR MULTI-PART HANDLING ---
+                    # --- REVISED LOOP LOGIC FOR MULTI-PART HANDLING --- 
                     function_call_part_to_execute = None
                     text_response_buffer = ""
                     processed_function_call_in_turn = False # Flag to ensure only one function call is processed per turn
@@ -225,7 +211,7 @@ class GeminiModel:
                             self.chat_history.append({'role': 'model', 'parts': [part]})
                             self._manage_context_window()
 
-                    # --- Now, decide action based on processed parts ---
+                    # --- Now, decide action based on processed parts --- 
                     if function_call_part_to_execute:
                         # === Execute the Tool === (Using stored details)
                         function_call = function_call_part_to_execute.function_call # Get the stored call
@@ -237,18 +223,38 @@ class GeminiModel:
                         user_rejected = False # Flag for user rejection
                         
                         # --- HUMAN IN THE LOOP CONFIRMATION ---
-                        if tool_name in ["edit", "create_file"]: 
-                            file_path = tool_args.get("file_path", "(unknown file)")
+                        # --- MODIFIED: Enhanced Confirmation Logic ---
+                        if tool_name in ["edit", "create_file", "formatter", "create_directory"]: # Added formatter & create_directory
+                            # Determine the primary path argument based on the tool
+                            if tool_name == "create_directory":
+                                file_path = tool_args.get("dir_path", "(unknown directory)")
+                            else: # edit, create_file, formatter
+                                file_path = tool_args.get("path") or tool_args.get("file_path", "(unknown file)")
+
                             content = tool_args.get("content") # Get content, might be None
                             old_string = tool_args.get("old_string") # Get old_string
                             new_string = tool_args.get("new_string") # Get new_string
                             
-                            panel_content = f"[bold yellow]Proposed change:[/bold yellow]\n[cyan]Tool:[/cyan] {tool_name}\n[cyan]File:[/cyan] {file_path}\n"
+                            action_description = f"Apply changes using [bold cyan]{tool_name}[/bold cyan] to [bold magenta]{file_path}[/bold magenta]?"
+                            panel_content = ""
                             
-                            if content is not None: # Case 1: Full content provided
+                            if tool_name == "formatter":
+                                panel_content = "[yellow]Action:[/yellow] Format file content."
+                            elif tool_name == "create_directory":
+                                panel_content = "[yellow]Action:[/yellow] Create new directory."
+                            elif content is not None: # Case 1: Full content provided (create or overwrite)
+                                action_verb = "Create/Overwrite" # Simplified, assume overwrite is possible
+                                if os.path.exists(file_path) and os.path.isdir(file_path):
+                                     action_verb = "[bold red]Error: Path is a directory[/bold red]" # Prevent overwriting dir
+                                elif not os.path.exists(os.path.dirname(os.path.abspath(file_path))):
+                                     action_verb = "Create file (and parent directories)"
+                                elif not os.path.exists(file_path):
+                                     action_verb = "Create file"
+                                     
+                                panel_content = f"[yellow]Action:[/yellow] {action_verb}.\n"
                                 # Prepare content preview (limit length?)
                                 preview_lines = content.splitlines()
-                                max_preview_lines = 30 # Limit preview for long content
+                                max_preview_lines = 25 # Limit preview
                                 if len(preview_lines) > max_preview_lines:
                                     content_preview = "\n".join(preview_lines[:max_preview_lines]) + f"\n... ({len(preview_lines) - max_preview_lines} more lines)"
                                 else:
@@ -256,27 +262,33 @@ class GeminiModel:
                                 panel_content += f"\n[bold]Content Preview:[/bold]\n---\n{content_preview}\n---"
                                 
                             elif old_string is not None and new_string is not None: # Case 2: Replacement
-                                max_snippet = 50 # Max chars to show for old/new strings
+                                panel_content = "[yellow]Action:[/yellow] Replace first occurrence.\n"
+                                max_snippet = 70 # Max chars to show for old/new strings
                                 old_snippet = old_string[:max_snippet] + ('...' if len(old_string) > max_snippet else '')
                                 new_snippet = new_string[:max_snippet] + ('...' if len(new_string) > max_snippet else '')
-                                panel_content += f"\n[bold]Action:[/bold] Replace occurrence of:\n---\n{old_snippet}\n---\n[bold]With:[/bold]\n---\n{new_snippet}\n---"
-                            else: # Case 3: Other/Unknown edit args
-                                 panel_content += "\n[italic](Preview not available for this edit type)"
+                                # --- FIXED: Removed trailing quote --- 
+                                panel_content += f"\n[bold red]- Remove:[/bold red]\n---\n{old_snippet}\n---"
+                                # --- END FIXED ---
+                                panel_content += f"\n[bold green]+ Add:[/bold green]\n---\n{new_snippet}\n---"
+                            else: # Case 3: Other/Unknown edit args or empty file creation
+                                 panel_content = "[yellow]Action:[/yellow] Create empty file or unknown edit operation."
 
                             # Use Rich Panel for better presentation
                             self.console.print(Panel(
-                                panel_content, # Use the constructed content
-                                title="Confirm File Modification",
+                                panel_content, 
+                                title="Confirm File/Directory Modification", # Updated title
                                 border_style="red",
-                                expand=False
+                                expand=False,
+                                subtitle=f"Tool: {tool_name}"
                             ))
                             
                             # Use questionary for confirmation
                             confirmed = questionary.confirm(
-                                "Apply this change?", 
+                                action_description, # Use the clearer description
                                 default=False, # Default to No
                                 auto_enter=False # Require Enter key press
                             ).ask()
+                        # --- END MODIFIED ---
                             
                             # Handle case where user might Ctrl+C during prompt
                             if confirmed is None: 
@@ -298,12 +310,29 @@ class GeminiModel:
                             
                             with self.console.status(f"[yellow]{status_msg}...", spinner="dots"):
                                 try:
-                                    tool_instance = get_tool(tool_name)
+                                    # --- MODIFIED: Handle SummarizeCodeTool instantiation --- 
+                                    if tool_name == "summarize_code":
+                                        tool_instance = AVAILABLE_TOOLS.get(tool_name)
+                                        if tool_instance:
+                                            # Pass the model instance ONLY to SummarizeCodeTool
+                                            tool_instance = tool_instance(model_instance=self.model)
+                                        else: 
+                                            tool_instance = None # Should not happen if AVAILABLE_TOOLS is correct
+                                    else:
+                                        # Standard instantiation for other tools
+                                        tool_instance = get_tool(tool_name)
+                                    # --- END MODIFIED ---
+                                    
                                     if tool_instance:
                                         log.debug(f"Executing tool '{tool_name}' with arguments: {tool_args}")
                                         tool_result = tool_instance.execute(**tool_args)
                                         log.info(f"Tool '{tool_name}' executed. Result length: {len(str(tool_result)) if tool_result else 0}")
                                         log.debug(f"Tool '{tool_name}' result: {str(tool_result)[:500]}...")
+                                        # --- MODIFIED: Check for errors in tool_result string --- 
+                                        if isinstance(tool_result, str) and tool_result.strip().startswith("Error:"):
+                                            log.error(f"Tool '{tool_name}' reported an error: {tool_result}")
+                                            tool_error = True
+                                        # --- END MODIFIED ---
                                     else:
                                         log.error(f"Tool '{tool_name}' not found.")
                                         tool_result = f"Error: Tool '{tool_name}' is not available."
@@ -313,11 +342,19 @@ class GeminiModel:
                                     tool_result = f"Error executing tool {tool_name}: {str(tool_exec_error)}"
                                     tool_error = True
                                 
-                                # --- Print Executed/Error INSIDE the status block ---
+                                # --- Print Executed/Error INSIDE the status block --- 
+                                # --- MODIFIED: Enhanced Error Display --- 
                                 if tool_error:
-                                    self.console.print(f"[red] -> Error executing {tool_name}: {str(tool_result)[:100]}...[/red]")
+                                    # Use Rich Panel for errors
+                                    self.console.print(Panel(
+                                        f"[bold]Tool:[/bold] {tool_name}\n[bold]Arguments:[/bold] {tool_args}\n\n[white]{str(tool_result)}[/white]",
+                                        title="Tool Execution Error",
+                                        border_style="bold red",
+                                        expand=False
+                                    ))
                                 else:
                                     self.console.print(f"[dim] -> Executed {tool_name}[/dim]") 
+                                # --- END MODIFIED ---
                             # --- End Status Block ---
                                 
                         # === Check for Task Completion Signal via Tool Call ===
@@ -343,8 +380,11 @@ class GeminiModel:
                         
                         if task_completed: 
                             break # Exit loop NOW that task_complete result is in history
-                        else:
-                            continue # IMPORTANT: Continue loop to let LLM react to function result
+                        # --- MODIFIED: Add continue even if tool errored, let LLM react --- 
+                        # else:
+                        #     continue # IMPORTANT: Continue loop to let LLM react to function result
+                        continue # Always continue after a function call/response cycle
+                        # --- END MODIFIED ---
                             
                     elif text_response_buffer: 
                         # === Only Text Returned ===
@@ -421,7 +461,9 @@ class GeminiModel:
 
         except Exception as e:
              log.error(f"Error during Agent Loop: {str(e)}", exc_info=True)
+             # --- MODIFIED: Clearer error message --- 
              return f"An unexpected error occurred during the agent process: {str(e)}"
+             # --- END MODIFIED ---
 
     # --- Context Management (Consider Token Counting) ---
     def _manage_context_window(self):
@@ -488,41 +530,43 @@ class GeminiModel:
 
         tool_list_str = "\n".join(tool_descriptions)
 
-        # Prompt v13.1 - Native Functions, Planning, Accurate Context
+        # --- MODIFIED: Prompt v13.3 - Enhanced Clarity & Interaction ---
         return f"""You are Gemini Code, an AI coding assistant running in a CLI environment.
-Your goal is to help the user with their coding tasks by understanding their request, planning the necessary steps, and using the available tools via **native function calls**.
+Your primary goal is to assist the user with coding tasks by understanding their request, planning steps, and utilizing available tools via **native function calls**. Strive for clarity, accuracy, and proactive assistance.
 
 Available Tools (Use ONLY these via function calls):
 {tool_list_str}
 
-Workflow:
-1.  **Analyze & Plan:** Understand the user's request based on the provided directory context (`ls` output) and the request itself. For non-trivial tasks, **first outline a brief plan** of the steps and tools you will use in a text response. **Note:** Actions that modify files (`edit`, `create_file`) will require user confirmation before execution.
-2.  **Execute:** If a plan is not needed or after outlining the plan, make the **first necessary function call** to execute the next step (e.g., `view` a file, `edit` a file, `grep` for text, `tree` for structure).
-3.  **Observe:** You will receive the result of the function call (or a message indicating user rejection). Use this result to inform your next step.
-4.  **Repeat:** Based on the result, make the next function call required to achieve the user's goal. Continue calling functions sequentially until the task is complete.
-5.  **Complete:** Once the *entire* task is finished, **you MUST call the `task_complete` function**, providing a concise summary of what was done in the `summary` argument. 
-    *   The `summary` argument MUST accurately reflect the final outcome (success, partial success, error, or what was done).
-    *   Format the summary using **Markdown** for readability (e.g., use backticks for filenames `like_this.py` or commands `like this`).
-    *   If code was generated or modified, the summary **MUST** contain the **actual, specific commands** needed to run or test the result (e.g., show `pip install Flask` and `python app.py`, not just say "instructions provided"). Use Markdown code blocks for commands.
+Core Workflow:
+1.  **Analyze & Plan:** Carefully read the user's request and the provided directory context (`ls` output).
+    *   **Ask Clarifying Questions:** If the request is ambiguous or lacks detail, ask specific questions before proceeding (e.g., "Which file should I modify?", "What should the function return?").
+    *   **Outline Plan:** For non-trivial tasks involving multiple steps, respond with a brief, numbered plan outlining the tools you intend to use (e.g., 1. `view` file.py, 2. `edit` file.py, 3. `test_runner`).
+    *   **State Intent:** Clearly state when you are about to perform an action, especially filesystem modifications (e.g., "Okay, I will now use the `edit` tool to add the function to `utils.py`. This requires confirmation.").
+2.  **Execute Step:** Make the **single function call** needed for the current step in your plan.
+    *   **Confirmation Required:** Remember that `edit`, `create_directory`, `formatter`, and potentially `bash` (depending on the command) require user confirmation. The system handles this prompt.
+3.  **Observe & Adapt:** Analyze the result of the function call (or user rejection).
+    *   If the tool succeeded, proceed to the next step in your plan.
+    *   If the tool failed or the user rejected the action, explain the issue and suggest an alternative or ask for guidance.
+4.  **Iterate:** Repeat steps 2 and 3 until the user's request is fully addressed.
+5.  **Complete Task:** Once the *entire* task is finished successfully, **you MUST call the `task_complete` function**.
+    *   Provide a concise, accurate `summary` in Markdown, detailing what was done (e.g., "Created `new_script.py` and added a basic function. You can run it with `python new_script.py`.").
+    *   If code was changed, the summary **MUST** include specific commands to run or test the result (use Markdown code blocks).
 
-Important Rules:
-*   **Use Native Functions:** ONLY interact with tools by making function calls as defined above. Do NOT output tool calls as text (e.g., `cli_tools.ls(...)`).
-*   **Sequential Calls:** Call functions one at a time. You will get the result back before deciding the next step. Do not try to chain calls in one turn.
-*   **Initial Context Handling:** When the user asks a general question about the codebase contents (e.g., "what's in this directory?", "show me the files", "whats in this codebase?"), your **first** response MUST be a summary or list of **ALL** files and directories provided in the initial context (`ls` or `tree` output). Do **NOT** filter this initial list or make assumptions (e.g., about virtual environments). Only after presenting the full initial context should you suggest further actions or use other tools if necessary.
-*   **Accurate Context Reporting:** When asked about directory contents (like "whats in this codebase?"), accurately list or summarize **all** relevant files and directories shown in the `ls` or `tree` output, including common web files (`.html`, `.js`, `.css`), documentation (`.md`), configuration files, build artifacts, etc., not just specific source code types. Do not ignore files just because virtual environments are also present. Use `tree` for a hierarchical view if needed.
-*   **Handling Explanations:** 
-    *   If the user asks *how* to do something, asks for an explanation, or requests instructions (like "how do I run this?"), **provide the explanation or instructions directly in a text response** using clear Markdown formatting.
-    *   **Proactive Assistance:** When providing instructions that culminate in a specific execution command (like `python file.py`, `npm start`, `git status | cat`, etc.), first give the full explanation, then **explicitly ask the user if they want you to run that final command** using the `execute_command` tool. 
-        *   Example: After explaining how to run `calculator.py`, you should ask: "Would you like me to run `python calculator.py | cat` for you using the `execute_command` tool?" (Append `| cat` for commands that might page).
-    *   Do *not* use `task_complete` just for providing information; only use it when the *underlying task* (e.g., file creation, modification) is fully finished.
-*   **Planning First:** For tasks requiring multiple steps (e.g., read file, modify content, write file), explain your plan briefly in text *before* the first function call.
-*   **Precise Edits:** When editing files (`edit` tool), prefer viewing the relevant section first (`view` tool with offset/limit), then use exact `old_string`/`new_string` arguments if possible. Only use the `content` argument for creating new files or complete overwrites.
-*   **Task Completion Signal:** ALWAYS finish action-oriented tasks by calling `task_complete(summary=...)`. 
-    *   The `summary` argument MUST accurately reflect the final outcome (success, partial success, error, or what was done).
-    *   Format the summary using **Markdown** for readability (e.g., use backticks for filenames `like_this.py` or commands `like this`).
-    *   If code was generated or modified, the summary **MUST** contain the **actual, specific commands** needed to run or test the result (e.g., show `pip install Flask` and `python app.py`, not just say "instructions provided"). Use Markdown code blocks for commands.
+Key Interaction Principles:
+*   **Native Functions Only:** Interact with tools *exclusively* through function calls. Do NOT write tool calls as text (e.g., `cli_tools.ls(...)`).
+*   **One Call Per Turn:** Execute only one function call per response. Wait for the result before the next call.
+*   **Full Initial Context:** When asked generally about the workspace ("what's here?", "list files"), your *first* response must list or summarize **ALL** files/directories from the initial `ls` context. Do not filter or make assumptions. Use `tree` if hierarchy is important.
+*   **Accurate Reporting:** When listing files/directories later, be comprehensive and accurate based on `ls` or `tree` output. Include config files, docs, etc.
+*   **Explanations & Instructions:**
+    *   If asked *how* to do something or for an explanation, provide it directly in a text response using clear Markdown.
+    *   **Proactive Command Execution:** After explaining steps culminating in a command (e.g., `python run.py`, `pytest`, `git status | cat`), **ask the user** if they want you to run it using the appropriate tool (`bash`, `test_runner`). Example: "I've explained how to run the tests. Would you like me to execute `pytest` using the `test_runner` tool?" (Append `| cat` to `bash` commands that might page output).
+    *   Do *not* call `task_complete` just for providing information.
+*   **Precise Edits:** Prefer `view` with offset/limit before `edit`. Use `old_string`/`new_string` for targeted replacements. Use `content` mainly for new files or full overwrites.
+*   **Error Handling:** If a tool fails, report the error clearly and suggest a fix or alternative approach.
 
-The user's first message will contain initial directory context and their request."""
+The user's first message contains initial directory context and their request. Begin by analyzing this information.
+"""
+        # --- END MODIFIED ---
 
     # --- Text Extraction Helper (if needed for final output) ---
     def _extract_text_from_response(self, response) -> str | None:
