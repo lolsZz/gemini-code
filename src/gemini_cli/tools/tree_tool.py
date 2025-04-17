@@ -33,16 +33,22 @@ class TreeTool(BaseTool):
     # Optional args: path, depth
     required_args: list[str] = []
 
-    def execute(self, path: str | None = None, depth: int | None = None) -> str:
+    def execute(self, path: str | None = None, depth: int | str | None = None) -> str:
         """Executes the tree command."""
         
         if depth is None:
             depth_limit = DEFAULT_TREE_DEPTH
         else:
-            # Clamp depth to be within reasonable limits
-            depth_limit = max(1, min(depth, MAX_TREE_DEPTH))
+            # Convert depth to int if it's a string
+            try:
+                depth_int = int(depth) if isinstance(depth, str) else depth
+                # Clamp depth to be within reasonable limits
+                depth_limit = max(1, min(depth_int, MAX_TREE_DEPTH))
+            except (ValueError, TypeError):
+                log.error(f"Invalid depth value provided: {depth}. Using default depth {DEFAULT_TREE_DEPTH}")
+                depth_limit = DEFAULT_TREE_DEPTH
             
-        command = ['tree', f'-L {depth_limit}']
+        command = ['tree', '-L', str(depth_limit)]
         
         # Add path if specified
         target_path = "." # Default to current directory
@@ -90,3 +96,4 @@ class TreeTool(BaseTool):
         except Exception as e:
             log.exception(f"An unexpected error occurred while executing tree command for path '{target_path}': {e}")
             return f"An unexpected error occurred while executing tree: {str(e)}" 
+
